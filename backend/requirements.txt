@@ -21,3 +21,7 @@ python-multipart
 passlib[bcrypt]
 matplotlib
 tqdm
+pymongo
+motor
+python-dotenv
+email-validator

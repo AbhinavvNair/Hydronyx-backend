@@ -4,8 +4,23 @@ import joblib
 import numpy as np
 import json
 import os
+import sys
 from rapidfuzz import fuzz
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+from datetime import datetime
+
+# Add backend directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from auth_routes import router as auth_router
+from forecast_routes import router as forecast_router
+from policy_routes import router as policy_router
+from optimizer_routes import router as optimizer_router
+from validation_routes import router as validation_router
+from database import Database, create_indexes
+
+load_dotenv()
 
 app = FastAPI(title="Groundwater Prototype API", version="2.0")
 
@@ -18,22 +33,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Startup Event ---
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database connection"""
+    try:
+        Database.connect_db()
+        create_indexes()
+        print("[OK] Database initialized successfully")
+    except Exception as e:
+        print(f"[ERROR] Database initialization error: {e}")
+
+# --- Shutdown Event ---
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close database connection"""
+    Database.close_db()
+
+# --- Include Auth Routes ---
+app.include_router(auth_router)
+app.include_router(forecast_router)
+app.include_router(policy_router)
+app.include_router(optimizer_router)
+app.include_router(validation_router)
+
 # --- Helper function ---
 def _clean(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.lower()
 
 # --- Load Data (using correct paths from backend directory) ---
-rainfall = pd.read_csv("../data/rainfall.csv")
+backend_dir = os.path.dirname(os.path.abspath(__file__))
+data_dir = os.path.join(backend_dir, "..", "data")
+
+rainfall = pd.read_csv(os.path.join(data_dir, "rainfall.csv"))
 rainfall["state_name"] = _clean(rainfall["state_name"])
 rainfall["year_month"] = rainfall["year_month"].astype(str)
 
-groundwater = pd.read_csv("../data/groundwater.csv")
+groundwater = pd.read_csv(os.path.join(data_dir, "groundwater.csv"))
 groundwater["state_name"] = _clean(groundwater["state_name"])
 groundwater["district_name"] = _clean(groundwater["district_name"])
 groundwater["year_month"] = groundwater["year_month"].astype(str)
 
 # --- Load trained model ---
-model = joblib.load("../models/groundwater_predictor.pkl")
+model = joblib.load(os.path.join(backend_dir, "..", "models", "groundwater_predictor.pkl"))
 
 # --- Load user credentials for fuzzy login ---
 with open("users.json") as f:
