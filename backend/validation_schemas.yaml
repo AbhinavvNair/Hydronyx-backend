@@ -1,0 +1,4 @@
+# Basic schema thresholds for validation checks
+missing_threshold: 0.1  # proportion of allowed missing values per column
+negative_rainfall_flag: true
+# Add additional per-column or per-file rules here

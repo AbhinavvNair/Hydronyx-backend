@@ -68,6 +68,15 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return encoded_jwt
 
 
+def rotate_secret(new_secret: str):
+    """Rotate the in-memory SECRET_KEY. Persisting the secret should be done
+    by updating environment/store outside of this process in production.
+    """
+    global SECRET_KEY
+    SECRET_KEY = new_secret
+    return True
+
+
 def create_refresh_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """Create a JWT refresh token"""
     to_encode = data.copy()

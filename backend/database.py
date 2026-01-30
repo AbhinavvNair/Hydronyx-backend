@@ -68,3 +68,8 @@ def create_indexes():
     users.create_index("email", unique=True)
     
     print("[OK] Database indexes created")
+
+
+def get_validation_runs_collection():
+    db = Database.get_db()
+    return db['validation_runs']

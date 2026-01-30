@@ -31,11 +31,17 @@ async def register(user: UserRegister):
         "name": user.name,
         "password": hashed_password,
         "created_at": datetime.utcnow(),
-        "is_active": True
+        "is_active": True,
+        "is_verified": False,
+        "verification_token": None
     }
     
     result = users_collection.insert_one(user_doc)
     user_doc["id"] = str(result.inserted_id)
+    # Create a verification token and store it; in production send via email
+    from auth_utils import create_access_token
+    token = create_access_token({"sub": user.email}, expires_delta=timedelta(hours=24))
+    users_collection.update_one({"email": user.email}, {"$set": {"verification_token": token}})
     
     return UserResponse(
         id=user_doc["id"],
@@ -43,6 +49,22 @@ async def register(user: UserRegister):
         name=user_doc["name"],
         created_at=user_doc["created_at"]
     )
+
+
+
+@router.get("/verify-email")
+async def verify_email(token: str):
+    """Verify an email using the token sent at registration.
+
+    In production this should be linked from an email; here it sets `is_verified`.
+    """
+    users_collection = get_users_collection()
+    # find user with matching token
+    user = users_collection.find_one({"verification_token": token})
+    if not user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid token")
+    users_collection.update_one({"_id": user["_id"]}, {"$set": {"is_verified": True, "verification_token": None}})
+    return {"status": "ok", "message": "Email verified"}
 
 
 @router.post("/login", response_model=Token)
@@ -156,3 +178,33 @@ async def get_current_user(authorization: str = Header(None)):
 async def logout():
     """Logout user (token invalidation handled by client)"""
     return {"message": "Logged out successfully"}
+
+
+@router.post("/rotate-secret")
+async def rotate_secret(new_secret: str, authorization: str = Header(None)):
+    """Rotate the JWT secret in-memory. Caller must be an admin.
+
+    NOTE: This only updates the running process; persist new secret in environment
+    or secret manager for production deployments.
+    """
+    if not authorization:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authorization header")
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authorization header format")
+    token = authorization.split(" ")[1]
+    email = verify_token(token)
+    if not email:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+
+    users_collection = get_users_collection()
+    user = users_collection.find_one({"email": email})
+    if not user or not user.get("is_active"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    # For safety require an `is_admin` flag on the user doc
+    if not user.get("is_admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+
+    from auth_utils import rotate_secret as _rotate
+    _rotate(new_secret)
+    return {"status": "ok", "message": "Secret rotated in-memory; persist externally"}

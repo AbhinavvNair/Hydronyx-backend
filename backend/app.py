@@ -5,10 +5,13 @@ import numpy as np
 import json
 import os
 import sys
-from rapidfuzz import fuzz
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from datetime import datetime
+from fastapi import Request
+from starlette.responses import JSONResponse
+from time import time
+from collections import defaultdict
 
 # Add backend directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -23,6 +26,29 @@ from database import Database, create_indexes
 load_dotenv()
 
 app = FastAPI(title="Groundwater Prototype API", version="2.0")
+
+# Simple in-memory rate limiter (per-IP sliding window)
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX_PER_WINDOW", "30"))
+_rate_store = defaultdict(list)
+
+
+@app.middleware("http")
+async def simple_rate_limiter(request: Request, call_next):
+    # Allow internal health checks without limiting
+    ip = request.client.host if request.client else "unknown"
+    now = time()
+    window = RATE_LIMIT_WINDOW
+    arr = _rate_store[ip]
+    # drop old timestamps
+    while arr and arr[0] <= now - window:
+        arr.pop(0)
+    if len(arr) >= RATE_LIMIT_MAX:
+        return JSONResponse(status_code=429, content={"detail": "Too many requests"})
+    arr.append(now)
+    _rate_store[ip] = arr
+    response = await call_next(request)
+    return response
 
 # --- Enable CORS for frontend ---
 app.add_middleware(
@@ -77,22 +103,6 @@ groundwater["year_month"] = groundwater["year_month"].astype(str)
 # --- Load trained model ---
 model = joblib.load(os.path.join(backend_dir, "..", "models", "groundwater_predictor.pkl"))
 
-# --- Load user credentials for fuzzy login ---
-with open("users.json") as f:
-    USERS = json.load(f)
-
-def fuzzy_login(input_user: str, input_pass: str, threshold: int = 85) -> bool:
-    """
-    Check login using fuzzy string matching.
-    Returns True if both username and password are close enough.
-    """
-    for stored_user, stored_pass in USERS.items():
-        user_score = fuzz.ratio(input_user, stored_user)
-        pass_score = fuzz.ratio(input_pass, stored_pass)
-
-        if user_score >= threshold and pass_score >= threshold:
-            return True
-    return False
 
 # --- API Routes ---
 @app.get("/")
@@ -100,11 +110,7 @@ def root():
     return {"status": "ok", "message": "Groundwater Backend API is running"}
 
 # --- Authentication ---
-@app.get("/api/login")
-def login(username: str = Query(...), password: str = Query(...)):
-    if fuzzy_login(username, password):
-        return {"status": "success", "message": "Login granted"}
-    raise HTTPException(status_code=401, detail="Invalid credentials")
+# Legacy fuzzy-login removed. Use the secure `/api/auth` endpoints for registration and login.
 
 # --- Data Endpoints ---
 @app.get("/api/months")
