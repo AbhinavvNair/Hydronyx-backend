@@ -63,13 +63,20 @@ def get_forecast_collection():
 def create_indexes():
     """Create database indexes"""
     users = get_users_collection()
-    
-    # Create unique index on email
     users.create_index("email", unique=True)
-    
+
+    policy_sims = get_policy_simulations_collection()
+    policy_sims.create_index([("user_id", 1), ("created_at", -1)])
+
     print("[OK] Database indexes created")
 
 
 def get_validation_runs_collection():
     db = Database.get_db()
     return db['validation_runs']
+
+
+def get_policy_simulations_collection():
+    """Collection for stored policy intervention summaries."""
+    db = Database.get_db()
+    return db['policy_simulations']

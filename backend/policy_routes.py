@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, status, Header
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel
-from database import get_users_collection
+from database import get_users_collection, get_policy_simulations_collection
 from auth_utils import verify_token
 import pandas as pd
 import numpy as np
@@ -236,7 +236,7 @@ async def simulate_policy(
              params.crop_intensity_change ** 2) / 3
         ) / 100.0
         
-        return PolicySimulationResult(
+        result = PolicySimulationResult(
             baseline_trajectory=baseline_traj,
             counterfactual_trajectory=counterfactual_traj,
             mean_effect=mean_effect,
@@ -244,11 +244,67 @@ async def simulate_policy(
             cumulative_effect=cumulative_effect,
             uncertainty_margin=float(uncertainty)
         )
+
+        # Store intervention summary in database
+        try:
+            coll = get_policy_simulations_collection()
+            doc = {
+                "user_id": user_id,
+                "params": {
+                    "state": params.state,
+                    "pumping_change": params.pumping_change,
+                    "recharge_structures": params.recharge_structures,
+                    "crop_intensity_change": params.crop_intensity_change,
+                    "months_ahead": params.months_ahead,
+                },
+                "result": {
+                    "mean_effect": result.mean_effect,
+                    "final_effect": result.final_effect,
+                    "cumulative_effect": result.cumulative_effect,
+                    "uncertainty_margin": result.uncertainty_margin,
+                },
+                "baseline_trajectory": [{"month": t.month, "groundwater": t.groundwater, "rainfall": t.rainfall} for t in baseline_traj],
+                "counterfactual_trajectory": [{"month": t.month, "groundwater": t.groundwater, "rainfall": t.rainfall} for t in counterfactual_traj],
+                "created_at": datetime.utcnow(),
+            }
+            coll.insert_one(doc)
+        except Exception as store_err:
+            # Log but do not fail the request
+            import traceback
+            traceback.print_exc()
+
+        return result
     
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Policy simulation failed: {str(e)}"
+        )
+
+
+@router.get("/history")
+async def get_intervention_history(
+    limit: int = 20,
+    authorization: str = Header(None),
+):
+    """Get the current user's stored intervention summaries (most recent first)."""
+    user_id = extract_user_id(authorization)
+    try:
+        coll = get_policy_simulations_collection()
+        cursor = coll.find(
+            {"user_id": user_id},
+            sort=[("created_at", -1)],
+            limit=min(limit, 100),
+        )
+        items = []
+        for doc in cursor:
+            doc["id"] = str(doc.pop("_id"))
+            items.append(doc)
+        return {"interventions": items, "count": len(items)}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load intervention history: {str(e)}",
         )
 
 
