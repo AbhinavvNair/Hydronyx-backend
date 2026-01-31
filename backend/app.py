@@ -28,8 +28,9 @@ load_dotenv()
 app = FastAPI(title="Groundwater Prototype API", version="2.0")
 
 # Simple in-memory rate limiter (per-IP sliding window)
+# Increase RATE_LIMIT_MAX_PER_WINDOW in .env if you hit 429 during development
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
-RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX_PER_WINDOW", "30"))
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX_PER_WINDOW", "120"))
 _rate_store = defaultdict(list)
 
 

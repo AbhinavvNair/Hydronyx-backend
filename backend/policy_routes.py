@@ -1,13 +1,81 @@
 from fastapi import APIRouter, HTTPException, status, Header
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel
 from database import get_users_collection
 from auth_utils import verify_token
 import pandas as pd
 import numpy as np
+import os
 
 router = APIRouter(prefix="/api/policy", tags=["policy"])
+
+# Cached data for state-specific baselines
+_groundwater_df: Optional[pd.DataFrame] = None
+_rainfall_df: Optional[pd.DataFrame] = None
+
+
+def _get_groundwater_df() -> pd.DataFrame:
+    global _groundwater_df
+    if _groundwater_df is not None:
+        return _groundwater_df
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(backend_dir, "..", "data")
+    path = os.path.join(data_dir, "groundwater.csv")
+    if not os.path.exists(path):
+        _groundwater_df = pd.DataFrame()
+        return _groundwater_df
+    df = pd.read_csv(path)
+    df["state_name"] = df["state_name"].astype(str).str.strip().str.lower()
+    if "gw_level_m_bgl" in df.columns:
+        df["gw_level_m_bgl"] = pd.to_numeric(df["gw_level_m_bgl"], errors="coerce")
+    _groundwater_df = df.dropna(subset=["gw_level_m_bgl"])
+    return _groundwater_df
+
+
+def _get_rainfall_df() -> pd.DataFrame:
+    global _rainfall_df
+    if _rainfall_df is not None:
+        return _rainfall_df
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(backend_dir, "..", "data")
+    path = os.path.join(data_dir, "rainfall.csv")
+    if not os.path.exists(path):
+        _rainfall_df = pd.DataFrame()
+        return _rainfall_df
+    df = pd.read_csv(path)
+    df["state_name"] = df["state_name"].astype(str).str.strip().str.lower()
+    _rainfall_df = df
+    return _rainfall_df
+
+
+def _state_baselines(state: str) -> Tuple[float, float]:
+    """
+    Return (base_gw_level_m, base_rainfall_mm_per_year) for the given state from real data.
+    Fallback (45.0, 800.0) if no data.
+    """
+    state_clean = str(state).strip().lower()
+    base_gw = 45.0
+    base_rainfall = 800.0
+
+    gw_df = _get_groundwater_df()
+    if not gw_df.empty:
+        subset = gw_df[gw_df["state_name"] == state_clean]["gw_level_m_bgl"]
+        if not subset.empty:
+            base_gw = float(subset.mean())
+
+    rain_df = _get_rainfall_df()
+    if not rain_df.empty:
+        for rain_col in ["rainfall_actual_mm", "rainfall_mm", "rainfall", "precipitation"]:
+            if rain_col in rain_df.columns:
+                subset = rain_df[rain_df["state_name"] == state_clean][rain_col]
+                subset = pd.to_numeric(subset, errors="coerce").dropna()
+                if not subset.empty:
+                    # monthly values -> annual approx
+                    base_rainfall = float(subset.mean()) * 12
+                    break
+
+    return base_gw, base_rainfall
 
 
 class InterventionParams(BaseModel):
@@ -95,14 +163,11 @@ async def simulate_policy(
     user_id = extract_user_id(authorization)
     
     try:
-        # Physics-informed simulation
         months = params.months_ahead
-        
-        # Base parameters (typical for Indian groundwater systems)
-        base_gw_level = 45.0  # meters below ground level
-        base_rainfall = 800.0  # mm/year
-        
-        # Initial values
+        # State-specific baselines from real data so different states get different trajectories
+        base_gw_level, base_rainfall = _state_baselines(params.state)
+        base_rainfall = max(base_rainfall, 100.0)  # avoid zero or negative
+
         baseline_traj = []
         counterfactual_traj = []
         
@@ -189,23 +254,16 @@ async def simulate_policy(
 
 @router.get("/states")
 async def get_available_states(authorization: str = Header(None)):
-    """Get list of available states for policy simulation"""
+    """Get list of available states from groundwater data (title-cased)."""
     extract_user_id(authorization)  # Verify auth
-    
-    # Available states in the system
-    states = [
-        "Maharashtra",
-        "Haryana",
-        "Punjab",
-        "Uttar Pradesh",
-        "Rajasthan",
-        "Gujarat",
-        "Madhya Pradesh",
-        "Karnataka",
-        "Tamil Nadu"
-    ]
-    
-    return {
-        "states": states,
-        "count": len(states)
-    }
+
+    df = _get_groundwater_df()
+    if df.empty:
+        states = [
+            "Maharashtra", "Haryana", "Punjab", "Uttar Pradesh",
+            "Rajasthan", "Gujarat", "Madhya Pradesh", "Karnataka", "Tamil Nadu",
+        ]
+    else:
+        states = sorted([str(s).title() for s in df["state_name"].unique()])
+
+    return {"states": states, "count": len(states)}
