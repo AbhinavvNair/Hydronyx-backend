@@ -44,6 +44,7 @@ class DataCheckItem(BaseModel):
 class DataValidationReport(BaseModel):
     checks: List[DataCheckItem]
     summary: Dict[str, Any]
+    reliability_scores: Optional[Dict[str, float]] = None  # per-dataset reliability 0-1
 
 
 class ConfidenceEntry(BaseModel):
@@ -89,6 +90,50 @@ class UncertaintyResponse(BaseModel):
 
 class UncertaintyResponseFull(UncertaintyResponse):
     source: str
+
+
+def _detect_outliers_iqr(series: pd.Series, multiplier: float = 1.5) -> int:
+    """Detect outliers using IQR method. Returns count of outliers."""
+    if series.dtype not in [np.float64, np.int64, float, int] or len(series.dropna()) < 4:
+        return 0
+    q1 = series.quantile(0.25)
+    q3 = series.quantile(0.75)
+    iqr = q3 - q1
+    if iqr == 0:
+        return 0
+    lower = q1 - multiplier * iqr
+    upper = q3 + multiplier * iqr
+    return int((series < lower) | (series > upper)).sum()
+
+
+def _detect_outliers_zscore(series: pd.Series, threshold: float = 3.0) -> int:
+    """Detect extreme outliers using Z-score. Returns count of outliers."""
+    if series.dtype not in [np.float64, np.int64, float, int] or len(series.dropna()) < 3:
+        return 0
+    mean = series.mean()
+    std = series.std()
+    if std == 0:
+        return 0
+    z = np.abs((series - mean) / std)
+    return int((z > threshold).sum())
+
+
+def _compute_reliability_score(
+    n_rows: int,
+    missing_rate: float,
+    outlier_rate: float,
+    has_negative: bool,
+    duplicate_rate: float,
+) -> float:
+    """Compute data reliability score 0-1. Higher is better."""
+    if n_rows == 0:
+        return 0.0
+    score = 1.0
+    score -= min(missing_rate * 2, 0.4)  # missing penalizes up to 0.4
+    score -= min(outlier_rate * 0.5, 0.3)  # outliers penalize up to 0.3
+    score -= 0.2 if has_negative else 0  # negative values
+    score -= min(duplicate_rate * 0.3, 0.2)  # duplicates
+    return max(0.0, min(1.0, round(score, 3)))
 
 
 def extract_user_id(authorization: str) -> str:
@@ -404,6 +449,9 @@ async def run_data_checks(authorization: str = Header(None)):
 
         # Load and run basic validations where possible
         summary: Dict[str, Any] = {}
+        reliability_scores: Dict[str, float] = {}
+        df_r = None
+        df_g = None
 
         if os.path.exists(rainfall_path):
             df_r = pd.read_csv(rainfall_path)
@@ -411,26 +459,66 @@ async def run_data_checks(authorization: str = Header(None)):
             duplicates = int(df_r.duplicated().sum())
             nrows = int(len(df_r))
             negative_rain = int((df_r.select_dtypes(include=[float, int]) < 0).any(axis=1).sum())
-            # simple anomaly detection thresholds
-            missing_rate = {k: (v / nrows if nrows > 0 else 0.0) for k, v in missing.items()}
-            anomaly = any(v > 0.1 for v in missing_rate.values()) or negative_rain > 0
-            details = {"rows": nrows, "missing_counts": missing, "missing_rate": missing_rate, "duplicates": duplicates, "negative_values_rows": negative_rain}
+            missing_rate_dict = {k: (v / nrows if nrows > 0 else 0.0) for k, v in missing.items()}
+            max_missing_rate = max(missing_rate_dict.values()) if missing_rate_dict else 0.0
+            anomaly = max_missing_rate > 0.1 or negative_rain > 0
+
+            # Outlier detection on numeric columns (IQR method)
+            outlier_count = 0
+            for col in df_r.select_dtypes(include=[np.number]).columns:
+                outlier_count += _detect_outliers_iqr(df_r[col], 1.5)
+            outlier_count = min(outlier_count, nrows)  # cap at nrows
+            outlier_rate = outlier_count / nrows if nrows > 0 else 0.0
+            dup_rate = duplicates / nrows if nrows > 0 else 0.0
+
+            reliability_scores["rainfall"] = _compute_reliability_score(
+                nrows, max_missing_rate, outlier_rate, negative_rain > 0, dup_rate
+            )
+
+            details = {
+                "rows": nrows, "missing_counts": missing, "missing_rate": missing_rate_dict,
+                "duplicates": duplicates, "negative_values_rows": negative_rain,
+                "outlier_count": outlier_count, "outlier_rate": round(outlier_rate, 4),
+                "reliability_score": reliability_scores["rainfall"]
+            }
             checks.append(DataCheckItem(name="rainfall_schema", ok=not anomaly, details=details))
+            checks.append(DataCheckItem(name="rainfall_outliers", ok=outlier_rate < 0.05, details={"outlier_count": outlier_count, "outlier_rate": round(outlier_rate, 4)}))
             summary["rainfall_rows"] = nrows
+            summary["rainfall_reliability"] = reliability_scores["rainfall"]
 
         if os.path.exists(groundwater_path):
             df_g = pd.read_csv(groundwater_path)
             missing = df_g.isna().sum().to_dict()
             duplicates = int(df_g.duplicated().sum())
             nrows = int(len(df_g))
-            missing_rate = {k: (v / nrows if nrows > 0 else 0.0) for k, v in missing.items()}
-            anomaly = any(v > 0.1 for v in missing_rate.values())
-            details = {"rows": nrows, "missing_counts": missing, "missing_rate": missing_rate, "duplicates": duplicates}
+            missing_rate_dict = {k: (v / nrows if nrows > 0 else 0.0) for k, v in missing.items()}
+            max_missing_rate = max(missing_rate_dict.values()) if missing_rate_dict else 0.0
+            anomaly = max_missing_rate > 0.1
+
+            # Outlier detection on numeric columns (e.g. gw_level_m_bgl)
+            outlier_count = 0
+            for col in df_g.select_dtypes(include=[np.number]).columns:
+                outlier_count += _detect_outliers_iqr(df_g[col], 1.5)
+            outlier_count = min(outlier_count, nrows)
+            outlier_rate = outlier_count / nrows if nrows > 0 else 0.0
+            dup_rate = duplicates / nrows if nrows > 0 else 0.0
+
+            reliability_scores["groundwater"] = _compute_reliability_score(
+                nrows, max_missing_rate, outlier_rate, False, dup_rate
+            )
+
+            details = {
+                "rows": nrows, "missing_counts": missing, "missing_rate": missing_rate_dict,
+                "duplicates": duplicates, "outlier_count": outlier_count,
+                "outlier_rate": round(outlier_rate, 4), "reliability_score": reliability_scores["groundwater"]
+            }
             checks.append(DataCheckItem(name="groundwater_schema", ok=not anomaly, details=details))
+            checks.append(DataCheckItem(name="groundwater_outliers", ok=outlier_rate < 0.05, details={"outlier_count": outlier_count, "outlier_rate": round(outlier_rate, 4)}))
             summary["groundwater_rows"] = nrows
+            summary["groundwater_reliability"] = reliability_scores["groundwater"]
 
         # Simple cross-file consistency: shared year_month values
-        if os.path.exists(rainfall_path) and os.path.exists(groundwater_path):
+        if os.path.exists(rainfall_path) and os.path.exists(groundwater_path) and df_r is not None and df_g is not None:
             set_r = set(df_r["year_month"].astype(str).unique()) if "year_month" in df_r.columns else set()
             set_g = set(df_g["year_month"].astype(str).unique()) if "year_month" in df_g.columns else set()
             shared = len(set_r.intersection(set_g))
@@ -442,8 +530,9 @@ async def run_data_checks(authorization: str = Header(None)):
             doc = {
                 'user_id': None,
                 'timestamp': datetime.utcnow(),
-                'checks': [c.dict() for c in checks],
+                'checks': [c.model_dump() if hasattr(c, 'model_dump') else c.dict() for c in checks],
                 'summary': summary,
+                'reliability_scores': reliability_scores,
             }
             try:
                 # attempt to set user id when possible
@@ -456,7 +545,7 @@ async def run_data_checks(authorization: str = Header(None)):
             # DB not available or insertion failed; ignore for now
             pass
 
-        return DataValidationReport(checks=checks, summary=summary)
+        return DataValidationReport(checks=checks, summary=summary, reliability_scores=reliability_scores if reliability_scores else None)
 
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

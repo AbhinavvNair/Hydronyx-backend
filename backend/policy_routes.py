@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, status, Header
+from fastapi import APIRouter, HTTPException, status, Header, Query
+from fastapi.responses import Response
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel
@@ -7,6 +8,7 @@ from auth_utils import verify_token
 import pandas as pd
 import numpy as np
 import os
+import io
 
 router = APIRouter(prefix="/api/policy", tags=["policy"])
 
@@ -306,6 +308,37 @@ async def get_intervention_history(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to load intervention history: {str(e)}",
         )
+
+
+@router.get("/export-pdf")
+async def export_policy_pdf(
+    intervention_id: str = Query(...),
+    authorization: str = Header(None),
+):
+    """Export policy comparison as PDF."""
+    from policy_pdf import generate_policy_comparison_pdf
+    from bson.objectid import ObjectId
+    user_id = extract_user_id(authorization)
+    try:
+        coll = get_policy_simulations_collection()
+        doc = coll.find_one({"_id": ObjectId(intervention_id), "user_id": user_id})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Intervention not found")
+        params = doc.get("params", {})
+        result = doc.get("result", {})
+        bl_traj = doc.get("baseline_trajectory", [])
+        cf_traj = doc.get("counterfactual_trajectory", [])
+        pdf_bytes = generate_policy_comparison_pdf(
+            {"baseline_trajectory": bl_traj},
+            {"counterfactual_trajectory": cf_traj},
+            params,
+            result,
+        )
+        return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=policy_comparison.pdf"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/states")

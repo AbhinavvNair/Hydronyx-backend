@@ -21,6 +21,9 @@ from forecast_routes import router as forecast_router
 from policy_routes import router as policy_router
 from optimizer_routes import router as optimizer_router
 from validation_routes import router as validation_router
+from rainfall_routes import router as rainfall_router
+from alerts_routes import router as alerts_router
+from drivers_routes import router as drivers_router
 from database import Database, create_indexes
 
 load_dotenv()
@@ -83,6 +86,9 @@ app.include_router(forecast_router)
 app.include_router(policy_router)
 app.include_router(optimizer_router)
 app.include_router(validation_router)
+app.include_router(rainfall_router)
+app.include_router(alerts_router)
+app.include_router(drivers_router)
 
 # --- Helper function ---
 def _clean(s: pd.Series) -> pd.Series:

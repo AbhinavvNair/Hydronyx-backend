@@ -1,14 +1,25 @@
-from fastapi import APIRouter, HTTPException, status, Header
+from fastapi import APIRouter, HTTPException, status, Header, Body
 from datetime import timedelta, datetime
 from bson.objectid import ObjectId
+from pydantic import BaseModel, EmailStr
 from auth_utils import (
     UserRegister, UserLogin, Token, UserResponse,
     hash_password, verify_password, create_access_token,
     create_refresh_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
 )
 from database import get_users_collection
+from email_service import send_verification_email, send_password_reset_email
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -33,15 +44,16 @@ async def register(user: UserRegister):
         "created_at": datetime.utcnow(),
         "is_active": True,
         "is_verified": False,
-        "verification_token": None
+        "verification_token": None,
+        "role": "viewer",  # RBAC: admin, analyst, viewer
     }
     
     result = users_collection.insert_one(user_doc)
     user_doc["id"] = str(result.inserted_id)
-    # Create a verification token and store it; in production send via email
     from auth_utils import create_access_token
-    token = create_access_token({"sub": user.email}, expires_delta=timedelta(hours=24))
+    token = create_access_token({"sub": user.email, "type": "verify"}, expires_delta=timedelta(hours=24))
     users_collection.update_one({"email": user.email}, {"$set": {"verification_token": token}})
+    send_verification_email(user.email, token, user.name)
     
     return UserResponse(
         id=user_doc["id"],
@@ -170,7 +182,8 @@ async def get_current_user(authorization: str = Header(None)):
         id=str(user["_id"]),
         email=user["email"],
         name=user["name"],
-        created_at=user["created_at"]
+        created_at=user["created_at"],
+        role=user.get("role", "viewer"),
     )
 
 
@@ -178,6 +191,36 @@ async def get_current_user(authorization: str = Header(None)):
 async def logout():
     """Logout user (token invalidation handled by client)"""
     return {"message": "Logged out successfully"}
+
+
+@router.post("/forgot-password")
+async def forgot_password(body: PasswordResetRequest):
+    """Request password reset. Sends email with reset link if user exists."""
+    users_collection = get_users_collection()
+    user = users_collection.find_one({"email": body.email})
+    if not user:
+        return {"status": "ok", "message": "If an account exists, a reset link was sent."}
+    from auth_utils import create_access_token
+    token = create_access_token({"sub": user["email"], "type": "reset"}, expires_delta=timedelta(hours=1))
+    users_collection.update_one({"email": body.email}, {"$set": {"reset_token": token, "reset_token_expires": datetime.utcnow() + timedelta(hours=1)}})
+    send_password_reset_email(body.email, token)
+    return {"status": "ok", "message": "If an account exists, a reset link was sent."}
+
+
+@router.post("/reset-password")
+async def reset_password(body: PasswordResetConfirm):
+    """Confirm password reset using token from email."""
+    users_collection = get_users_collection()
+    user = users_collection.find_one({"reset_token": body.token})
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+    expires = user.get("reset_token_expires")
+    if expires and datetime.utcnow() > expires:
+        users_collection.update_one({"_id": user["_id"]}, {"$unset": {"reset_token": "", "reset_token_expires": ""}})
+        raise HTTPException(status_code=400, detail="Reset token has expired")
+    hashed = hash_password(body.new_password)
+    users_collection.update_one({"_id": user["_id"]}, {"$set": {"password": hashed}, "$unset": {"reset_token": "", "reset_token_expires": ""}})
+    return {"status": "ok", "message": "Password reset successfully"}
 
 
 @router.post("/rotate-secret")
@@ -201,8 +244,8 @@ async def rotate_secret(new_secret: str, authorization: str = Header(None)):
     if not user or not user.get("is_active"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
 
-    # For safety require an `is_admin` flag on the user doc
-    if not user.get("is_admin"):
+    # RBAC: require admin role or is_admin flag
+    if user.get("role") != "admin" and not user.get("is_admin"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
 
     from auth_utils import rotate_secret as _rotate

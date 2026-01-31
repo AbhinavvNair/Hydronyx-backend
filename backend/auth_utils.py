@@ -44,6 +44,7 @@ class UserResponse(BaseModel):
     email: str
     name: str
     created_at: datetime
+    role: Optional[str] = "viewer"
 
 
 def hash_password(password: str) -> str:

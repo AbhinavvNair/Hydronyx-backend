@@ -1,4 +1,6 @@
 # Basic schema thresholds for validation checks
 missing_threshold: 0.1  # proportion of allowed missing values per column
 negative_rainfall_flag: true
+outlier_iqr_multiplier: 1.5  # IQR multiplier for outlier detection (1.5 = standard)
+outlier_zscore_threshold: 3.0  # Z-score threshold for extreme outliers
 # Add additional per-column or per-file rules here
