@@ -24,6 +24,7 @@ from validation_routes import router as validation_router
 from rainfall_routes import router as rainfall_router
 from alerts_routes import router as alerts_router
 from drivers_routes import router as drivers_router
+from location_routes import router as location_router
 from database import Database, create_indexes
 
 load_dotenv()
@@ -89,6 +90,7 @@ app.include_router(validation_router)
 app.include_router(rainfall_router)
 app.include_router(alerts_router)
 app.include_router(drivers_router)
+app.include_router(location_router)
 
 # --- Helper function ---
 def _clean(s: pd.Series) -> pd.Series:
