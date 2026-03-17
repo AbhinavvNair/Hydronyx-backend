@@ -14,11 +14,18 @@ import numpy as np
 import pandas as pd
 import os
 import io
+import math
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import HexColor
 from scipy.spatial.distance import cdist
+from data_loader import (
+    estimate_gwl, confidence_score, field_water_map, 
+    calculate_trend, get_nearest_wells, latest_gwl,
+    get_trend_with_confidence, forecast_from_trend
+)
+from shapely.geometry import shape, Point
 
 from auth_utils import verify_token
 from database import get_forecast_collection, get_users_collection
@@ -307,13 +314,13 @@ async def get_location_groundwater_insight(
     authorization: str = Header(None)
 ):
     """
-    Get groundwater insight at arbitrary lat/lon using IDW from nearest stations.
+    Get groundwater insight at arbitrary lat/lon using real stations data.
     
     Request body:
     {
         "latitude": 26.9124,
         "longitude": 75.7873,
-        "months_ahead": 6,
+        "months_ahead": 12,
         "k": 8,
         "power": 2.0
     }
@@ -336,23 +343,31 @@ async def get_location_groundwater_insight(
         if req.months_ahead < 1 or req.months_ahead > 12:
             raise ValueError("months_ahead must be between 1 and 12")
         
-        # Get nearest stations
-        nearest = _get_nearest_stations(req.latitude, req.longitude, k=req.k)
+        # Use real dataset for estimation
+        estimated_gwl, used_wells = estimate_gwl(req.latitude, req.longitude, k=req.k)
         
-        if nearest.empty:
-            raise ValueError("No nearby stations found")
+        if estimated_gwl is None:
+            raise ValueError("No nearby stations with valid data found")
         
-        # Perform IDW interpolation
-        current_level, contributing_stations = _idw_interpolation(
-            req.latitude, req.longitude, nearest, power=req.power
-        )
-        
-        # Get trend from weighted average of nearest stations
+        # Calculate trend from nearby wells using improved method
         trends = []
-        for idx, station in nearest.iterrows():
-            t_m_month, _ = _estimate_trend(station["station_code"])
-            trends.append(t_m_month)
+        trend_confidences = []
+        for well in used_wells[:5]:  # Use top 5 wells for trend
+            trend, trend_type, trend_conf = get_trend_with_confidence(well["station_code"])
+            if trend != 0.0:  # Only include non-zero trends
+                trends.append(trend)
+                trend_confidences.append(trend_conf)
+        
         avg_trend = float(np.mean(trends)) if trends else 0.0
+        
+        # Determine overall trend confidence
+        if trend_confidences:
+            confidence_counts = {"High": trend_confidences.count("High"), 
+                              "Medium": trend_confidences.count("Medium"), 
+                              "Low": trend_confidences.count("Low")}
+            overall_trend_confidence = max(confidence_counts, key=confidence_counts.get)
+        else:
+            overall_trend_confidence = "Low"
         
         # Classify trend
         if avg_trend < -0.01:
@@ -362,42 +377,30 @@ async def get_location_groundwater_insight(
         else:
             trend_type = "stable"
         
-        # Generate forecast (simple linear extrapolation with noise)
-        forecast_data = []
-        np.random.seed(42)  # For reproducibility
-        for month in range(1, req.months_ahead + 1):
-            pred_level = current_level + (avg_trend * month)
-            uncertainty = _estimate_uncertainty(req.k, req.power)
-            lower = pred_level - uncertainty
-            upper = pred_level + uncertainty
-            
-            forecast_data.append({
-                "month": month,
-                "predicted_level": float(pred_level),
-                "lower_bound": float(lower),
-                "upper_bound": float(upper),
-            })
+        # Generate forecast using improved method
+        forecast_data = forecast_from_trend(estimated_gwl, avg_trend, req.months_ahead)
         
-        # Estimate metrics
-        uncertainty = _estimate_uncertainty(req.k, req.power)
-        confidence = _estimate_confidence(req.k)
+        # Calculate confidence
+        confidence = confidence_score(used_wells)
         
-        # Sort contributing stations by weight (descending)
-        contributing_stations.sort(key=lambda x: x["weight"], reverse=True)
+        # Calculate uncertainty
+        avg_distance = np.mean([w["distance_km"] for w in used_wells])
+        uncertainty_m = 2.0 + (avg_distance * 0.5)
         
         response = LocationInsightResponse(
-            current_level_m_bgl=current_level,
-            trend_m_per_month=avg_trend,
+            current_level_m_bgl=float(estimated_gwl),
+            trend_m_per_month=float(avg_trend),
             trend=trend_type,
-            uncertainty_m=uncertainty,
+            uncertainty_m=float(uncertainty_m),
             confidence=confidence,
             forecast=forecast_data,
-            nearest_stations=contributing_stations,
+            nearest_stations=used_wells,
             meta={
                 "method": "IDW",
                 "k": req.k,
                 "power": req.power,
-                "stations_used": len(contributing_stations),
+                "stations_used": len(used_wells),
+                "avg_distance_km": round(avg_distance, 2),
                 "generated_at": datetime.utcnow().isoformat(),
             }
         )
@@ -413,15 +416,320 @@ async def get_location_groundwater_insight(
                 "result": response.dict(),
                 "created_at": datetime.utcnow(),
             })
-        except Exception as e:
-            print(f"[WARN] Failed to log forecast: {e}")
+        except Exception as db_error:
+            print(f"[WARNING] Failed to log to database: {db_error}")
         
         return response
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[ERROR] Location insight error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+class PlotInsightRequest(BaseModel):
+    polygon: Dict[str, Any]  # Changed from polygon_geojson to polygon
+    months_ahead: int = 12
+    k: int = 8
+    power: float = 2.0
+    grid_size: int = 14
+
+
+class PlotPointInsight(BaseModel):
+    latitude: float
+    longitude: float
+    current_level_m_bgl: float
+    trend_m_per_month: float
+    uncertainty_m: float
+    confidence: str
+    zone: str
+    risk_score: float
+
+
+class PlotInsightResponse(BaseModel):
+    plot_stats: Dict[str, Any]
+    grid: List[PlotPointInsight]
+    recommended_point: Dict[str, Any]
+    generated_at: str
+
+
+def _extract_user_id_from_bearer(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+    token = authorization.replace("Bearer ", "")
+    user_id = verify_token(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return user_id
+
+
+def _compute_location_metrics(lat: float, lon: float, months_ahead: int, k: int, power: float) -> Dict[str, Any]:
+    """Compute location metrics without DB logging; reuses IDW + trend logic."""
+    # Get nearest stations
+    nearest = _get_nearest_stations(lat, lon, k=k)
+    if nearest.empty:
+        raise ValueError("No nearby stations found")
+
+    current_level, contributing_stations = _idw_interpolation(lat, lon, nearest, power=power)
+
+    # Weighted-ish average trend: here simple mean of station trends (consistent with existing endpoint)
+    trends = []
+    for _, station in nearest.iterrows():
+        t_m_month, _ = _estimate_trend(station["station_code"])
+        trends.append(t_m_month)
+    avg_trend = float(np.mean(trends)) if trends else 0.0
+
+    if avg_trend < -0.01:
+        trend_type = "declining"
+    elif avg_trend > 0.01:
+        trend_type = "improving"
+    else:
+        trend_type = "stable"
+
+    uncertainty = _estimate_uncertainty(k, power)
+    confidence = _estimate_confidence(k)
+
+    # Build forecast (kept simple; plot-insight uses stats primarily)
+    forecast_data: List[Dict[str, Any]] = []
+    for month in range(1, months_ahead + 1):
+        pred_level = current_level + (avg_trend * month)
+        lower = pred_level - uncertainty
+        upper = pred_level + uncertainty
+        forecast_data.append({
+            "month": month,
+            "predicted_level": float(pred_level),
+            "lower_bound": float(lower),
+            "upper_bound": float(upper),
+        })
+
+    contributing_stations.sort(key=lambda x: x["weight"], reverse=True)
+
+    return {
+        "current_level_m_bgl": float(current_level),
+        "trend_m_per_month": float(avg_trend),
+        "trend": trend_type,
+        "uncertainty_m": float(uncertainty),
+        "confidence": confidence,
+        "forecast": forecast_data,
+        "nearest_stations": contributing_stations,
+        "meta": {
+            "method": "IDW",
+            "k": k,
+            "power": power,
+            "stations_used": len(contributing_stations),
+        },
+    }
+
+
+def _risk_score(current_level_m_bgl: float, trend_m_per_month: float, uncertainty_m: float, confidence: str) -> float:
+    """Heuristic risk score for borewell viability; higher is worse."""
+    score = 0.0
+    # Deep water table is riskier
+    if current_level_m_bgl > 60:
+        score += 3.0
+    elif current_level_m_bgl > 40:
+        score += 2.0
+    elif current_level_m_bgl > 25:
+        score += 1.0
+
+    # Declining (in this dataset negative is labeled declining in _estimate_trend)
+    if trend_m_per_month < -0.03:
+        score += 3.0
+    elif trend_m_per_month < -0.01:
+        score += 2.0
+    elif trend_m_per_month < 0.0:
+        score += 1.0
+
+    # Uncertainty penalty
+    if uncertainty_m > 5:
+        score += 2.0
+    elif uncertainty_m > 3:
+        score += 1.0
+
+    if confidence == "Low":
+        score += 1.5
+    elif confidence == "Medium":
+        score += 0.75
+
+    return float(score)
+
+
+def _zone_from_score(score: float) -> str:
+    if score >= 6.0:
+        return "Red"
+    if score >= 3.5:
+        return "Yellow"
+    return "Green"
+
+
+@router.post("/plot-insight", response_model=PlotInsightResponse)
+async def get_plot_groundwater_insight(req: PlotInsightRequest, authorization: str = Header(None)):
+    """Plot-level insight using real stations data for a farm boundary."""
+    _extract_user_id_from_bearer(authorization)
+
+    try:
+        if req.k < 3 or req.k > 25:
+            raise ValueError("k must be between 3 and 25")
+        if req.months_ahead < 1 or req.months_ahead > 12:
+            raise ValueError("months_ahead must be between 1 and 12")
+        if req.grid_size < 6 or req.grid_size > 40:
+            raise ValueError("grid_size must be between 6 and 40")
+
+        geom = shape(req.polygon)
+        if geom.is_empty:
+            raise ValueError("Empty polygon")
+        if geom.geom_type not in ("Polygon", "MultiPolygon"):
+            raise ValueError("polygon must be a Polygon or MultiPolygon")
+
+        minx, miny, maxx, maxy = geom.bounds
+        # bounds sanity
+        if not (-180 <= minx <= 180 and -180 <= maxx <= 180 and -90 <= miny <= 90 and -90 <= maxy <= 90):
+            raise ValueError("Polygon bounds look invalid")
+
+        # Generate grid points inside polygon using real dataset
+        step_deg = 0.001  # ~100m steps
+        grid_points = []
+        
+        lat = miny
+        while lat <= maxy:
+            lon = minx
+            while lon <= maxx:
+                point = Point(lon, lat)
+                if geom.contains(point):
+                    grid_points.append((lat, lon))
+                lon += step_deg
+            lat += step_deg
+
+        if not grid_points:
+            raise ValueError("No grid points fell inside the polygon. Try a larger plot or smaller grid_size.")
+
+        # Sample points if too many
+        max_points = req.grid_size * req.grid_size
+        if len(grid_points) > max_points:
+            indices = np.random.choice(len(grid_points), max_points, replace=False)
+            grid_points = [grid_points[i] for i in indices]
+
+        # Process each grid point with real data
+        sampled: List[Dict[str, Any]] = []
+        for lat, lon in grid_points:
+            try:
+                # Use real dataset estimation
+                estimated_gwl, used_wells = estimate_gwl(lat, lon, k=req.k)
+                
+                if estimated_gwl is None:
+                    continue
+                
+                # Calculate trend from nearby wells using improved method
+                trends = []
+                for well in used_wells[:3]:
+                    trend, trend_type, trend_conf = get_trend_with_confidence(well["station_code"])
+                    if trend != 0.0:  # Only include non-zero trends
+                        trends.append(trend)
+                
+                avg_trend = float(np.mean(trends)) if trends else 0.0
+                
+                # Calculate risk score
+                rs = _risk_score(
+                    current_level_m_bgl=estimated_gwl,
+                    trend_m_per_month=avg_trend,
+                    uncertainty_m=2.0 + (np.mean([w["distance_km"] for w in used_wells]) * 0.5),
+                    confidence=confidence_score(used_wells)
+                )
+                
+                sampled.append({
+                    "latitude": lat,
+                    "longitude": lon,
+                    "current_level_m_bgl": estimated_gwl,
+                    "trend_m_per_month": avg_trend,
+                    "uncertainty_m": 2.0 + (np.mean([w["distance_km"] for w in used_wells]) * 0.5),
+                    "confidence": confidence_score(used_wells),
+                    "risk_score": rs,
+                    "zone": _zone_from_score(rs),
+                    "_nearest_stations": used_wells,
+                })
+                
+            except Exception as e:
+                print(f"Error processing grid point {lat}, {lon}: {e}")
+                continue
+
+        if not sampled:
+            raise ValueError("No valid grid points could be processed. Try a different area.")
+
+        # Calculate statistics
+        levels = np.array([s["current_level_m_bgl"] for s in sampled], dtype=float)
+        trends = np.array([s["trend_m_per_month"] for s in sampled], dtype=float)
+        scores = np.array([s["risk_score"] for s in sampled], dtype=float)
+
+        best_idx = int(np.argmin(scores))
+        best = sampled[best_idx]
+
+        plot_stats = {
+            "n_samples": int(len(sampled)),
+            "current_level_mean_m_bgl": float(np.mean(levels)),
+            "current_level_min_m_bgl": float(np.min(levels)),
+            "current_level_max_m_bgl": float(np.max(levels)),
+            "trend_mean_m_per_month": float(np.mean(trends)),
+            "risk_score_mean": float(np.mean(scores)),
+            "zone_counts": {
+                "Green": int(sum(1 for s in sampled if s["zone"] == "Green")),
+                "Yellow": int(sum(1 for s in sampled if s["zone"] == "Yellow")),
+                "Red": int(sum(1 for s in sampled if s["zone"] == "Red")),
+            },
+        }
+
+        reasons: List[str] = []
+        if best["current_level_m_bgl"] > plot_stats["current_level_mean_m_bgl"]:
+            reasons.append("Is point par paani thoda gehra hai, lekin plot ke hisaab se yeh sabse stable zone hai.")
+        else:
+            reasons.append("Is point par paani plot ke average se upar (better) hai.")
+        if best["trend_m_per_month"] < -0.01:
+            reasons.append("Trend declining hai — pumping ko control/recharge consider karein.")
+        if best["confidence"] == "Low":
+            reasons.append("Nearby monitoring wells kam hain — isliye confidence low hai.")
+
+        recommended_point = {
+            "latitude": best["latitude"],
+            "longitude": best["longitude"],
+            "zone": best["zone"],
+            "risk_score": best["risk_score"],
+            "current_level_m_bgl": best["current_level_m_bgl"],
+            "trend_m_per_month": best["trend_m_per_month"],
+            "uncertainty_m": best["uncertainty_m"],
+            "confidence": best["confidence"],
+            "reasons": reasons,
+            "nearest_stations": best.get("_nearest_stations", [])[:8],
+        }
+
+        grid = [
+            PlotPointInsight(
+                latitude=s["latitude"],
+                longitude=s["longitude"],
+                current_level_m_bgl=s["current_level_m_bgl"],
+                trend_m_per_month=s["trend_m_per_month"],
+                uncertainty_m=s["uncertainty_m"],
+                confidence=s["confidence"],
+                zone=s["zone"],
+                risk_score=s["risk_score"],
+            )
+            for s in sampled
+        ]
+
+        return PlotInsightResponse(
+            plot_stats=plot_stats,
+            grid=grid,
+            recommended_point=recommended_point,
+            generated_at=datetime.utcnow().isoformat(),
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Plot insight error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

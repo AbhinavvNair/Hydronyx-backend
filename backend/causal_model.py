@@ -1,8 +1,4 @@
-"""
-Structural Causal Model for Groundwater Policy Counterfactuals
-================================================================
-Implements SCM for estimating causal effects of interventions.
-"""
+
 
 import numpy as np
 import pandas as pd

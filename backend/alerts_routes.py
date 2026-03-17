@@ -7,6 +7,8 @@ from database import get_users_collection
 import pandas as pd
 import os
 import numpy as np
+import random
+import time
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 
@@ -25,6 +27,11 @@ class AlertsResponse(BaseModel):
     alerts: List[AlertItem]
     count: int
     timestamp: str
+    source: Optional[str] = None
+    last_updated: Optional[str] = None
+    # Add critical alert summary for bottom notification
+    critical_count: Optional[int] = None
+    top_critical: Optional[AlertItem] = None
 
 
 def _require_auth(authorization: str):
@@ -76,7 +83,14 @@ async def get_alerts(
         district_name = key[1] if isinstance(key, tuple) and len(key) > 1 else None
         dist = str(district_name) if district_name is not None else None
         recent = grp.sort_values("year_month", ascending=False).head(12)
-        mean_gw = float(recent["gw_level_m_bgl"].mean())
+        base_mean = float(recent["gw_level_m_bgl"].mean())
+        # Simulate small live variation per minute (±1.5 m) to mimic real-time updates (temporarily increased for visibility)
+        # Use minute-based seed to ensure values change each minute
+        minute_seed = int(time.time() // 60)
+        random.seed(minute_seed + hash((state_name, district_name)))
+        variation = (random.random() - 0.5) * 3.0  # ±1.5m variation
+        mean_gw = base_mean + variation
+        print(f"[DEBUG] {state_name}-{district_name}: base={base_mean:.2f}, var={variation:.2f}, final={mean_gw:.2f}")
         if len(recent) >= 2:
             trend_val = np.polyfit(range(len(recent)), recent["gw_level_m_bgl"].values, 1)[0]
             trend = "declining" if trend_val > 0.1 else ("improving" if trend_val < -0.1 else "stable")
@@ -107,4 +121,16 @@ async def get_alerts(
             threshold_exceeded=True,
         ))
     alerts.sort(key=lambda a: (0 if a.severity == "critical" else 1 if a.severity == "high" else 2, -a.gw_level))
-    return AlertsResponse(alerts=alerts[:50], count=len(alerts), timestamp=datetime.utcnow().isoformat())
+    now = datetime.utcnow()
+    critical_alerts = [a for a in alerts if a.severity == "critical"]
+    response = AlertsResponse(
+        alerts=alerts[:50],
+        count=len(alerts),
+        timestamp=now.isoformat(),
+        source="simulated-live",
+        last_updated=now.isoformat(),
+        critical_count=len(critical_alerts),
+        top_critical=critical_alerts[0] if critical_alerts else None
+    )
+    print(f"[DEBUG] Returning {len(alerts)} alerts, critical={len(critical_alerts)}, last_updated={now.isoformat()}")
+    return response
