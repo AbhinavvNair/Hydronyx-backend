@@ -26,5 +26,5 @@ motor
 python-dotenv
 email-validator
 argon2-cffi
-reportlabgeopy
-shapely
+reportlab
+geopy
