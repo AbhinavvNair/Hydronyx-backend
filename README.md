@@ -372,13 +372,13 @@ Frontend available at: http://localhost:3000
 ### Authentication Endpoints
 | Method | Endpoint | Description | Auth |
 |--------|----------|-------------|------|
-| POST | `/api/auth/register` | Register new user | ❌ |
-| POST | `/api/auth/login` | Login & get token | ❌ |
+| POST | `/api/auth/register` | Register new user | ✅ |
+| POST | `/api/auth/login` | Login & get token | ✅ |
 | POST | `/api/auth/logout` | Logout | ✅ |
 | GET | `/api/auth/verify-email` | Verify email token | ❌ |
 | POST | `/api/auth/refresh-token` | Refresh JWT token | ✅ |
-| POST | `/api/auth/forgot-password` | Request password reset | ❌ |
-| POST | `/api/auth/reset-password` | Confirm password reset | ❌ |
+| POST | `/api/auth/forgot-password` | Request password reset | ✅ |
+| POST | `/api/auth/reset-password` | Confirm password reset | ✅ |
 
 ### Forecasting Endpoints
 | Method | Endpoint | Description | Auth |
