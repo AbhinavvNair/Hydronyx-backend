@@ -129,12 +129,14 @@ async def login(credentials: UserLogin, response: Response):
     refresh_token = create_refresh_token(data={"sub": user["email"]})
 
     # Set httpOnly cookies so browser clients don't need to touch localStorage
+    # SameSite=None required for cross-domain (frontend on vercel, backend on render)
+    cookie_samesite = "none" if COOKIE_SECURE else "lax"
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite="lax",
+        samesite=cookie_samesite,
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
     response.set_cookie(
@@ -142,7 +144,7 @@ async def login(credentials: UserLogin, response: Response):
         value=refresh_token,
         httponly=True,
         secure=COOKIE_SECURE,
-        samesite="lax",
+        samesite=cookie_samesite,
         max_age=7 * 24 * 60 * 60,  # 7 days
     )
 
