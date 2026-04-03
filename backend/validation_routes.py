@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 from database import get_users_collection, get_validation_runs_collection
-from auth_utils import verify_token
+from auth_utils import verify_token, extract_user_id
 import numpy as np
 import os
 import pandas as pd
@@ -138,49 +138,6 @@ def _compute_reliability_score(
     score -= min(duplicate_rate * 0.3, 0.2)  # duplicates
     return max(0.0, min(1.0, round(score, 3)))
 
-
-def extract_user_id(authorization: str) -> str:
-    """Extract user_id from Bearer token"""
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authorization header"
-        )
-    
-    try:
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authorization scheme"
-            )
-        
-        user_email = verify_token(token)
-        if not user_email:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired token"
-            )
-        
-        users_collection = get_users_collection()
-        user = users_collection.find_one({"email": user_email})
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User not found"
-            )
-        
-        return str(user["_id"])
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header format"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token validation failed: {str(e)}"
-        )
 
 
 @router.get("/metrics", response_model=ValidationResponse)

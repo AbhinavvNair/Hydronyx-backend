@@ -7,7 +7,7 @@ using Inverse Distance Weighting (IDW) from nearby monitoring stations.
 
 from fastapi import APIRouter, HTTPException, status, Header
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 import numpy as np
@@ -27,8 +27,11 @@ from data_loader import (
 )
 from shapely.geometry import shape, Point
 
-from auth_utils import verify_token
+from auth_utils import verify_token, extract_user_id
 from database import get_forecast_collection, get_users_collection
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/location", tags=["location"])
 
@@ -290,11 +293,11 @@ def _estimate_confidence(k: int) -> str:
 
 
 class LocationInsightRequest(BaseModel):
-    latitude: float
-    longitude: float
-    months_ahead: int = 6
-    k: int = 8
-    power: float = 2.0
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    months_ahead: int = Field(6, ge=1, le=12)
+    k: int = Field(8, ge=3, le=25)
+    power: float = Field(2.0, ge=1.0, le=5.0)
 
 
 class LocationInsightResponse(BaseModel):
@@ -329,20 +332,12 @@ async def get_location_groundwater_insight(
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
     
-    token = authorization.replace("Bearer ", "")
+    token = authorization[7:]  # safe: startswith("Bearer ") already checked above
     user_id = verify_token(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token")
     
     try:
-        # Validate inputs
-        if not (-90 <= req.latitude <= 90 and -180 <= req.longitude <= 180):
-            raise ValueError("Invalid latitude/longitude")
-        if req.k < 3 or req.k > 25:
-            raise ValueError("k must be between 3 and 25")
-        if req.months_ahead < 1 or req.months_ahead > 12:
-            raise ValueError("months_ahead must be between 1 and 12")
-        
         # Use real dataset for estimation
         estimated_gwl, used_wells = estimate_gwl(req.latitude, req.longitude, k=req.k)
         
@@ -417,16 +412,16 @@ async def get_location_groundwater_insight(
                 "created_at": datetime.utcnow(),
             })
         except Exception as db_error:
-            print(f"[WARNING] Failed to log to database: {db_error}")
-        
+            logger.warning("Failed to log location query to database: %s", db_error)
+
         return response
-        
+
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Invalid request parameters")
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] Location insight error: {e}")
+        logger.error("Location insight error: %s", e)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -459,7 +454,7 @@ class PlotInsightResponse(BaseModel):
 def _extract_user_id_from_bearer(authorization: Optional[str]) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
-    token = authorization.replace("Bearer ", "")
+    token = authorization[7:]
     user_id = verify_token(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -568,7 +563,7 @@ def _zone_from_score(score: float) -> str:
 @router.post("/plot-insight", response_model=PlotInsightResponse)
 async def get_plot_groundwater_insight(req: PlotInsightRequest, authorization: str = Header(None)):
     """Plot-level insight using real stations data for a farm boundary."""
-    _extract_user_id_from_bearer(authorization)
+    extract_user_id(authorization)
 
     try:
         if req.k < 3 or req.k > 25:
@@ -725,11 +720,11 @@ async def get_plot_groundwater_insight(req: PlotInsightRequest, authorization: s
         )
 
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Invalid request parameters")
     except HTTPException:
         raise
     except Exception as e:
-        print(f"[ERROR] Plot insight error: {e}")
+        logger.error("Plot insight error: %s", e)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -857,7 +852,7 @@ async def download_location_report(
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
     
-    token = authorization.replace("Bearer ", "")
+    token = authorization[7:]  # safe: startswith("Bearer ") already checked above
     user_id = verify_token(token)
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token")

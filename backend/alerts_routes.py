@@ -1,8 +1,8 @@
 """Alerts for critical groundwater stress."""
 from fastapi import APIRouter, HTTPException, Header, Query
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from pydantic import BaseModel
-from auth_utils import verify_token
+from auth_utils import verify_token, extract_user_id
 from database import get_users_collection
 import pandas as pd
 import os
@@ -35,15 +35,11 @@ class AlertsResponse(BaseModel):
 
 
 def _require_auth(authorization: str):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing authorization")
-    token = authorization.split(" ")[1]
-    email = verify_token(token)
-    if not email:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    users = get_users_collection()
-    if not users.find_one({"email": email}):
-        raise HTTPException(status_code=401, detail="User not found")
+    extract_user_id(authorization)
+
+
+# Cache: (DataFrame with all alerts pre-computed, minute-bucket when it was built)
+_alerts_cache: Tuple[Optional[pd.DataFrame], int] = (None, -1)
 
 
 def _load_groundwater() -> pd.DataFrame:
@@ -60,42 +56,45 @@ def _load_groundwater() -> pd.DataFrame:
     return df.dropna(subset=["gw_level_m_bgl"])
 
 
-@router.get("", response_model=AlertsResponse)
-async def get_alerts(
-    state: Optional[str] = Query(None),
-    severity: Optional[str] = Query(None),
-    authorization: str = Header(None),
-):
-    """Get alerts for regions with critical groundwater stress."""
-    from datetime import datetime
-    _require_auth(authorization)
+def _build_alerts() -> List[AlertItem]:
+    """Compute all alerts from the groundwater CSV. Result is cached for 60 seconds."""
+    global _alerts_cache
+    minute_bucket = int(time.time() // 60)
+    cached_df, cached_bucket = _alerts_cache
+    if cached_df is not None and cached_bucket == minute_bucket:
+        return cached_df  # type: ignore[return-value]
+
     df = _load_groundwater()
     alerts: List[AlertItem] = []
     if df.empty:
-        return AlertsResponse(alerts=[], count=0, timestamp=datetime.utcnow().isoformat())
-    # Critical: GW > 25m bgl (deep); High: > 15m; Medium: > 10m
+        _alerts_cache = (alerts, minute_bucket)  # type: ignore[assignment]
+        return alerts
+
     CRITICAL_THRESHOLD = 25.0
     HIGH_THRESHOLD = 15.0
     MEDIUM_THRESHOLD = 10.0
+
     group_cols = ["state_name", "district_name"] if "district_name" in df.columns else ["state_name"]
-    for key, grp in df.groupby(group_cols):
+    df_sorted = df.sort_values("year_month")
+
+    for key, grp in df_sorted.groupby(group_cols):
         state_name = key[0] if isinstance(key, tuple) else key
         district_name = key[1] if isinstance(key, tuple) and len(key) > 1 else None
         dist = str(district_name) if district_name is not None else None
-        recent = grp.sort_values("year_month", ascending=False).head(12)
+
+        recent = grp.tail(12)
         base_mean = float(recent["gw_level_m_bgl"].mean())
-        # Simulate small live variation per minute (±1.5 m) to mimic real-time updates (temporarily increased for visibility)
-        # Use minute-based seed to ensure values change each minute
-        minute_seed = int(time.time() // 60)
-        random.seed(minute_seed + hash((state_name, district_name)))
-        variation = (random.random() - 0.5) * 3.0  # ±1.5m variation
+
+        random.seed(minute_bucket + abs(hash(f"{state_name}-{district_name}")))
+        variation = (random.random() - 0.5) * 3.0
         mean_gw = base_mean + variation
-        print(f"[DEBUG] {state_name}-{district_name}: base={base_mean:.2f}, var={variation:.2f}, final={mean_gw:.2f}")
+
         if len(recent) >= 2:
             trend_val = np.polyfit(range(len(recent)), recent["gw_level_m_bgl"].values, 1)[0]
             trend = "declining" if trend_val > 0.1 else ("improving" if trend_val < -0.1 else "stable")
         else:
             trend = "unknown"
+
         if mean_gw >= CRITICAL_THRESHOLD:
             sev = "critical"
             msg = f"Critical: GW level {mean_gw:.1f}m bgl (deep stress)"
@@ -107,10 +106,7 @@ async def get_alerts(
             msg = f"Moderate stress: GW level {mean_gw:.1f}m bgl"
         else:
             continue
-        if state and state.strip().lower() != state_name:
-            continue
-        if severity and severity != sev:
-            continue
+
         alerts.append(AlertItem(
             state=state_name.title(),
             district=dist.title() if dist else None,
@@ -120,17 +116,40 @@ async def get_alerts(
             trend=trend,
             threshold_exceeded=True,
         ))
+
     alerts.sort(key=lambda a: (0 if a.severity == "critical" else 1 if a.severity == "high" else 2, -a.gw_level))
+    _alerts_cache = (alerts, minute_bucket)  # type: ignore[assignment]
+    return alerts
+
+
+@router.get("", response_model=AlertsResponse)
+async def get_alerts(
+    state: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    authorization: str = Header(None),
+):
+    """Get alerts for regions with critical groundwater stress."""
+    from datetime import datetime
+    _require_auth(authorization)
+
+    all_alerts = _build_alerts()
+
+    # Apply optional filters
+    alerts = all_alerts
+    if state:
+        state_lower = state.strip().lower()
+        alerts = [a for a in alerts if a.state.lower() == state_lower]
+    if severity:
+        alerts = [a for a in alerts if a.severity == severity]
+
     now = datetime.utcnow()
     critical_alerts = [a for a in alerts if a.severity == "critical"]
-    response = AlertsResponse(
+    return AlertsResponse(
         alerts=alerts[:50],
         count=len(alerts),
         timestamp=now.isoformat(),
         source="simulated-live",
         last_updated=now.isoformat(),
         critical_count=len(critical_alerts),
-        top_critical=critical_alerts[0] if critical_alerts else None
+        top_critical=critical_alerts[0] if critical_alerts else None,
     )
-    print(f"[DEBUG] Returning {len(alerts)} alerts, critical={len(critical_alerts)}, last_updated={now.isoformat()}")
-    return response

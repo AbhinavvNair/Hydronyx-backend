@@ -5,6 +5,8 @@ import numpy as np
 import json
 import os
 import sys
+import logging
+import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from datetime import datetime
@@ -12,6 +14,12 @@ from fastapi import Request
 from starlette.responses import JSONResponse
 from time import time
 from collections import defaultdict
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("hydroai")
 
 # Add backend directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,6 +46,49 @@ RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX_PER_WINDOW", "120"))
 _rate_store = defaultdict(list)
 
 
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "60"))
+# Set to "true" in production (HTTPS only); leave unset or "false" in local dev
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+
+
+@app.middleware("http")
+async def cookie_to_bearer(request: Request, call_next):
+    """
+    If the request has no Authorization header but carries an access_token cookie,
+    inject it as a Bearer token so all existing route handlers work unchanged.
+    """
+    has_auth_header = any(k == b"authorization" for k, _ in request.scope.get("headers", []))
+    if not has_auth_header and "access_token" in request.cookies:
+        token = request.cookies["access_token"]
+        new_header = (b"authorization", f"Bearer {token}".encode())
+        request.scope["headers"] = list(request.scope.get("headers", [])) + [new_header]
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def timeout_middleware(request: Request, call_next):
+    try:
+        return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning("Request timed out: %s %s", request.method, request.url.path)
+        return JSONResponse(status_code=504, content={"detail": "Request timed out"})
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time()
+    response = await call_next(request)
+    duration_ms = (time() - start) * 1000
+    logger.info(
+        "%s %s %s %.1fms",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
+
+
 @app.middleware("http")
 async def simple_rate_limiter(request: Request, call_next):
     # Allow internal health checks without limiting
@@ -56,9 +107,12 @@ async def simple_rate_limiter(request: Request, call_next):
     return response
 
 # --- Enable CORS for frontend ---
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -4,51 +4,40 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel
 from database import get_users_collection, get_policy_simulations_collection
-from auth_utils import verify_token
+from auth_utils import verify_token, extract_user_id
 import pandas as pd
 import numpy as np
 import os
 import io
+import logging
+from functools import lru_cache
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/policy", tags=["policy"])
 
-# Cached data for state-specific baselines
-_groundwater_df: Optional[pd.DataFrame] = None
-_rainfall_df: Optional[pd.DataFrame] = None
-
-
+@lru_cache(maxsize=1)
 def _get_groundwater_df() -> pd.DataFrame:
-    global _groundwater_df
-    if _groundwater_df is not None:
-        return _groundwater_df
     backend_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(backend_dir, "..", "data")
-    path = os.path.join(data_dir, "groundwater.csv")
+    path = os.path.join(backend_dir, "..", "data", "groundwater.csv")
     if not os.path.exists(path):
-        _groundwater_df = pd.DataFrame()
-        return _groundwater_df
+        return pd.DataFrame()
     df = pd.read_csv(path)
     df["state_name"] = df["state_name"].astype(str).str.strip().str.lower()
     if "gw_level_m_bgl" in df.columns:
         df["gw_level_m_bgl"] = pd.to_numeric(df["gw_level_m_bgl"], errors="coerce")
-    _groundwater_df = df.dropna(subset=["gw_level_m_bgl"])
-    return _groundwater_df
+    return df.dropna(subset=["gw_level_m_bgl"])
 
 
+@lru_cache(maxsize=1)
 def _get_rainfall_df() -> pd.DataFrame:
-    global _rainfall_df
-    if _rainfall_df is not None:
-        return _rainfall_df
     backend_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(backend_dir, "..", "data")
-    path = os.path.join(data_dir, "rainfall.csv")
+    path = os.path.join(backend_dir, "..", "data", "rainfall.csv")
     if not os.path.exists(path):
-        _rainfall_df = pd.DataFrame()
-        return _rainfall_df
+        return pd.DataFrame()
     df = pd.read_csv(path)
     df["state_name"] = df["state_name"].astype(str).str.strip().str.lower()
-    _rainfall_df = df
-    return _rainfall_df
+    return df
 
 
 def _state_baselines(state: str) -> Tuple[float, float]:
@@ -102,49 +91,6 @@ class PolicySimulationResult(BaseModel):
     cumulative_effect: float
     uncertainty_margin: float
 
-
-def extract_user_id(authorization: str) -> str:
-    """Extract user_id from Bearer token"""
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authorization header"
-        )
-    
-    try:
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authorization scheme"
-            )
-        
-        user_email = verify_token(token)
-        if not user_email:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired token"
-            )
-        
-        users_collection = get_users_collection()
-        user = users_collection.find_one({"email": user_email})
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User not found"
-            )
-        
-        return str(user["_id"])
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header format"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token validation failed: {str(e)}"
-        )
 
 
 @router.post("/simulate", response_model=PolicySimulationResult)
@@ -271,16 +217,17 @@ async def simulate_policy(
             }
             coll.insert_one(doc)
         except Exception as store_err:
-            # Log but do not fail the request
-            import traceback
-            traceback.print_exc()
+            logger.error("Failed to persist policy simulation: %s", store_err)
 
         return result
-    
+
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error("Policy simulation error: %s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Policy simulation failed: {str(e)}"
+            detail="Policy simulation failed"
         )
 
 
@@ -304,9 +251,10 @@ async def get_intervention_history(
             items.append(doc)
         return {"interventions": items, "count": len(items)}
     except Exception as e:
+        logger.error("Failed to load intervention history: %s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to load intervention history: {str(e)}",
+            detail="Failed to load intervention history",
         )
 
 
@@ -338,7 +286,8 @@ async def export_policy_pdf(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("PDF export failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to generate PDF")
 
 
 @router.get("/states")

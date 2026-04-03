@@ -4,36 +4,31 @@ from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel
 from bson.objectid import ObjectId
 from database import get_forecast_collection, get_users_collection
-from auth_utils import verify_token
+from auth_utils import verify_token, extract_user_id
 import numpy as np
 import pandas as pd
 import os
+import logging
+from functools import lru_cache
 from model_utils import load_model
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/forecast", tags=["forecast"])
 
-# Cached groundwater data for state/district-specific stats
-_groundwater_df: Optional[pd.DataFrame] = None
-
-
+@lru_cache(maxsize=1)
 def _get_groundwater_df() -> pd.DataFrame:
     """Load groundwater CSV once and cache; normalize state/district to lowercase for matching."""
-    global _groundwater_df
-    if _groundwater_df is not None:
-        return _groundwater_df
     backend_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(backend_dir, "..", "data")
-    path = os.path.join(data_dir, "groundwater.csv")
+    path = os.path.join(backend_dir, "..", "data", "groundwater.csv")
     if not os.path.exists(path):
-        _groundwater_df = pd.DataFrame()
-        return _groundwater_df
+        return pd.DataFrame()
     df = pd.read_csv(path)
     df["state_name"] = df["state_name"].astype(str).str.strip().str.lower()
     df["district_name"] = df["district_name"].astype(str).str.strip().str.lower()
     if "gw_level_m_bgl" in df.columns:
         df["gw_level_m_bgl"] = pd.to_numeric(df["gw_level_m_bgl"], errors="coerce")
-    _groundwater_df = df.dropna(subset=["gw_level_m_bgl"])
-    return _groundwater_df
+    return df.dropna(subset=["gw_level_m_bgl"])
 
 
 def _state_gw_stats(state: str, district: Optional[str] = None) -> Tuple[float, float]:
@@ -84,50 +79,6 @@ class ForecastResponse(BaseModel):
     result: ForecastResult
     timestamp: str
 
-
-def extract_user_id(authorization: str) -> str:
-    """Extract user_id from Bearer token"""
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authorization header"
-        )
-    
-    try:
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authorization scheme"
-            )
-        
-        user_email = verify_token(token)
-        if not user_email:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired token"
-            )
-        
-        # Get user from database to get their ID
-        users_collection = get_users_collection()
-        user = users_collection.find_one({"email": user_email})
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User not found"
-            )
-        
-        return str(user["_id"])
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization header format"
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Token validation failed: {str(e)}"
-        )
 
 
 _fallback_model = None
@@ -243,12 +194,14 @@ async def generate_forecast(
         try:
             result_data = _run_stgnn_forecast(params)
         except Exception as stgnn_error:
+            logger.warning("STGNN forecast failed, trying fallback: %s", stgnn_error)
             try:
                 result_data = _run_fallback_forecast(params)
             except Exception as fb_error:
+                logger.error("Fallback forecast also failed: %s", fb_error)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"Forecast generation failed (STGNN error: {stgnn_error}; fallback error: {fb_error})"
+                    detail="Forecast generation failed"
                 )
 
         # Create forecast document
@@ -279,10 +232,13 @@ async def generate_forecast(
             timestamp=forecast_doc["timestamp"]
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error("Forecast route error: %s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Forecast generation failed: {str(e)}"
+            detail="Forecast generation failed"
         )
 
 

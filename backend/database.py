@@ -15,9 +15,16 @@ class Database:
 
     @classmethod
     def connect_db(cls):
-        """Connect to MongoDB"""
+        """Connect to MongoDB. Options tuned for Atlas (connection pool, retries)."""
         try:
-            cls.client = MongoClient(MONGODB_URL, serverSelectionTimeoutMS=5000)
+            cls.client = MongoClient(
+                MONGODB_URL,
+                serverSelectionTimeoutMS=5000,
+                maxPoolSize=20,
+                minPoolSize=2,
+                retryWrites=True,
+                retryReads=True,
+            )
             # Test connection
             cls.client.admin.command('ping')
             cls.db = cls.client[DATABASE_NAME]

@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, status, Header, Body
+from fastapi import APIRouter, HTTPException, status, Header, Body, Response
 from datetime import timedelta, datetime
+import os
 from bson.objectid import ObjectId
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from auth_utils import (
     UserRegister, UserLogin, Token, UserResponse,
     hash_password, verify_password, create_access_token,
@@ -9,6 +10,8 @@ from auth_utils import (
 )
 from database import get_users_collection
 from email_service import send_verification_email, send_password_reset_email
+
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 
@@ -19,7 +22,16 @@ class PasswordResetRequest(BaseModel):
 
 class PasswordResetConfirm(BaseModel):
     token: str
-    new_password: str
+    new_password: str = Field(..., min_length=8)
+
+    @field_validator("new_password")
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one digit")
+        return v
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -66,24 +78,33 @@ async def register(user: UserRegister):
 
 @router.get("/verify-email")
 async def verify_email(token: str):
-    """Verify an email using the token sent at registration.
+    """Verify an email using the signed JWT token sent at registration."""
+    # Validate the token cryptographically — prevents brute-force probing
+    email = verify_token(token, expected_type="verify")
+    if not email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired token")
 
-    In production this should be linked from an email; here it sets `is_verified`.
-    """
     users_collection = get_users_collection()
-    # find user with matching token
-    user = users_collection.find_one({"verification_token": token})
+    user = users_collection.find_one({"email": email})
     if not user:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid token")
-    users_collection.update_one({"_id": user["_id"]}, {"$set": {"is_verified": True, "verification_token": None}})
+
+    # Idempotent: already verified is not an error, just a no-op
+    if user.get("is_verified"):
+        return {"status": "ok", "message": "Email already verified"}
+
+    users_collection.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"is_verified": True, "verification_token": None}},
+    )
     return {"status": "ok", "message": "Email verified"}
 
 
 @router.post("/login", response_model=Token)
-async def login(credentials: UserLogin):
-    """Login user and return tokens"""
+async def login(credentials: UserLogin, response: Response):
+    """Login user and return tokens. Also sets httpOnly cookies for browser clients."""
     users_collection = get_users_collection()
-    
+
     # Find user by email
     user = users_collection.find_one({"email": credentials.email})
     if not user:
@@ -91,14 +112,14 @@ async def login(credentials: UserLogin):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
         )
-    
+
     # Verify password
     if not verify_password(credentials.password, user["password"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials"
         )
-    
+
     # Create tokens
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -106,7 +127,25 @@ async def login(credentials: UserLogin):
         expires_delta=access_token_expires
     )
     refresh_token = create_refresh_token(data={"sub": user["email"]})
-    
+
+    # Set httpOnly cookies so browser clients don't need to touch localStorage
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        max_age=7 * 24 * 60 * 60,  # 7 days
+    )
+
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -117,7 +156,7 @@ async def login(credentials: UserLogin):
 @router.post("/refresh", response_model=Token)
 async def refresh(refresh_token: str):
     """Refresh access token using refresh token"""
-    email = verify_token(refresh_token)
+    email = verify_token(refresh_token, expected_type="refresh")
     if not email:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -188,8 +227,10 @@ async def get_current_user(authorization: str = Header(None)):
 
 
 @router.post("/logout")
-async def logout():
-    """Logout user (token invalidation handled by client)"""
+async def logout(response: Response):
+    """Logout user. Clears httpOnly cookies."""
+    response.delete_cookie("access_token")
+    response.delete_cookie("refresh_token")
     return {"message": "Logged out successfully"}
 
 
