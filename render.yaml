@@ -7,3 +7,19 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12"
+      - key: ALLOWED_ORIGINS
+        value: "https://hydroai-pi.vercel.app,http://localhost:3000"
+      - key: ALLOWED_ORIGIN_PATTERNS
+        value: "https://hydroai-.*\\.vercel\\.app"
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: RATE_LIMIT_MAX_PER_WINDOW
+        value: "120"
+      - key: RATE_LIMIT_WINDOW_SECONDS
+        value: "60"
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "60"
+      # Set these as secret env vars in the Render dashboard — do NOT hardcode here:
+      # MONGODB_URL
+      # DATABASE_NAME
+      # SECRET_KEY

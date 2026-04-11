@@ -1,14 +1,19 @@
+import os
+import sys
+
+# Load .env before anything else so all modules see the correct env vars at import time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, Query, HTTPException
 import pandas as pd
 import joblib
 import numpy as np
 import json
-import os
-import sys
 import logging
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 from datetime import datetime
 from fastapi import Request
 from starlette.responses import JSONResponse
@@ -21,9 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("hydroai")
 
-# Add backend directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from auth_routes import router as auth_router
 from forecast_routes import router as forecast_router
 from policy_routes import router as policy_router
@@ -34,8 +36,6 @@ from alerts_routes import router as alerts_router
 from drivers_routes import router as drivers_router
 from location_routes import router as location_router
 from database import Database, create_indexes
-
-load_dotenv()
 
 app = FastAPI(title="Groundwater Prototype API", version="2.0")
 
@@ -107,12 +107,16 @@ async def simple_rate_limiter(request: Request, call_next):
     return response
 
 # --- Enable CORS for frontend ---
+# ALLOWED_ORIGINS: comma-separated exact origins
+# ALLOWED_ORIGIN_PATTERNS: regex for dynamic origins like Vercel preview URLs
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
 _allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+_origin_regex = os.getenv("ALLOWED_ORIGIN_PATTERNS", r"https://hydroai-.*\.vercel\.app")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
+    allow_origin_regex=_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
