@@ -245,22 +245,23 @@ async def generate_forecast(
 @router.get("/history")
 async def get_forecast_history(
     limit: int = 10,
+    skip: int = 0,
     authorization: str = Header(None)
 ):
-    """Get user's forecast history"""
+    """Get user's forecast history with optional pagination."""
     user_id = extract_user_id(authorization)
-    
+
     forecast_collection = get_forecast_collection()
+    total = forecast_collection.count_documents({"user_id": user_id})
     forecasts = list(
         forecast_collection.find(
             {"user_id": user_id},
             sort=[("created_at", -1)],
-            limit=limit
-        )
+        ).skip(skip).limit(limit)
     )
-    
+
     # Convert ObjectId to string
     for forecast in forecasts:
         forecast["_id"] = str(forecast["_id"])
-    
-    return {"forecasts": forecasts, "count": len(forecasts)}
+
+    return {"forecasts": forecasts, "count": len(forecasts), "total": total, "skip": skip}

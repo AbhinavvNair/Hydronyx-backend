@@ -1,12 +1,13 @@
-from fastapi import APIRouter, HTTPException, status, Header, Response
+from fastapi import APIRouter, HTTPException, status, Header, Response, Request
 from datetime import timedelta, datetime
 import os
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional
+from fastapi import Depends
 from auth_utils import (
     UserRegister, UserLogin, Token, UserResponse,
     hash_password, verify_password, create_access_token,
-    create_refresh_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
+    create_refresh_token, verify_token, require_role, ACCESS_TOKEN_EXPIRE_MINUTES
 )
 from database import get_users_collection
 from email_service import send_verification_email, send_password_reset_email
@@ -172,9 +173,12 @@ async def login(credentials: UserLogin, response: Response):
 
 
 @router.post("/refresh", response_model=Token)
-async def refresh(refresh_token: str, response: Response):
-    """Refresh access token using refresh token cookie or body param."""
-    email = verify_token(refresh_token, expected_type="refresh")
+async def refresh(request: Request, response: Response, refresh_token: Optional[str] = None):
+    """Refresh access token using the refresh_token cookie (or optional query param for API clients)."""
+    token = refresh_token or request.cookies.get("refresh_token")
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing refresh token")
+    email = verify_token(token, expected_type="refresh")
     if not email:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -207,7 +211,7 @@ async def refresh(refresh_token: str, response: Response):
 
     return {
         "access_token": access_token,
-        "refresh_token": refresh_token,
+        "refresh_token": token,
         "token_type": "bearer"
     }
 
@@ -348,23 +352,8 @@ async def reset_password(body: PasswordResetConfirm):
 
 
 @router.post("/rotate-secret")
-async def rotate_secret(new_secret: str, authorization: str = Header(None)):
+async def rotate_secret(new_secret: str, _admin=Depends(require_role("admin"))):
     """Rotate the JWT secret in-memory. Caller must be an admin."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authorization header")
-    token = authorization.split(" ")[1]
-    email = verify_token(token)
-    if not email:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
-
-    users_collection = get_users_collection()
-    user = users_collection.find_one({"email": email})
-    if not user or not user.get("is_active"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-
-    if user.get("role") != "admin" and not user.get("is_admin"):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
-
     from auth_utils import rotate_secret as _rotate
     _rotate(new_secret)
     return {"status": "ok", "message": "Secret rotated in-memory; persist externally"}

@@ -135,6 +135,40 @@ def extract_user_id(authorization: Optional[str]) -> str:
     return str(user["_id"])
 
 
+def require_role(required_role: str):
+    """
+    FastAPI dependency factory for role-based access control.
+
+    Usage:
+        @router.post("/admin-endpoint")
+        async def admin_endpoint(user=Depends(require_role("admin"))):
+            ...
+    """
+    from fastapi import HTTPException, Depends
+    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+    _bearer = HTTPBearer()
+
+    def _check(credentials: HTTPAuthorizationCredentials = Depends(_bearer)):
+        from database import get_users_collection
+        token = credentials.credentials
+        email = verify_token(token)
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        users = get_users_collection()
+        user = users.find_one({"email": email})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        if user.get("role") != required_role:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access denied: '{required_role}' role required",
+            )
+        return user
+
+    return _check
+
+
 def verify_token(token: str, expected_type: str = None) -> Optional[str]:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
