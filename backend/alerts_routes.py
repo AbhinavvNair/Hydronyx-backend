@@ -2,7 +2,7 @@
 from fastapi import APIRouter, HTTPException, Header, Query
 from typing import Optional, List, Tuple
 from pydantic import BaseModel
-from auth_utils import verify_token, extract_user_id
+from auth_utils import extract_user_id
 from database import get_users_collection
 import pandas as pd
 import os

@@ -10,7 +10,6 @@ from fastapi import FastAPI, Query, HTTPException
 import pandas as pd
 import joblib
 import numpy as np
-import json
 import logging
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
@@ -89,14 +88,28 @@ async def log_requests(request: Request, call_next):
     return response
 
 
+_AUTH_RATE_STORE = defaultdict(list)
+_AUTH_RATE_MAX = 10   # max login/register attempts per window
+_AUTH_RATE_WINDOW = 60  # seconds
+
 @app.middleware("http")
 async def simple_rate_limiter(request: Request, call_next):
-    # Allow internal health checks without limiting
     ip = request.client.host if request.client else "unknown"
     now = time()
+
+    # Stricter rate limit on auth mutation endpoints
+    if request.method == "POST" and request.url.path in ("/api/auth/login", "/api/auth/register", "/api/auth/forgot-password"):
+        arr = _AUTH_RATE_STORE[ip]
+        while arr and arr[0] <= now - _AUTH_RATE_WINDOW:
+            arr.pop(0)
+        if len(arr) >= _AUTH_RATE_MAX:
+            return JSONResponse(status_code=429, content={"detail": "Too many requests. Please wait before trying again."})
+        arr.append(now)
+        _AUTH_RATE_STORE[ip] = arr
+
+    # General rate limit
     window = RATE_LIMIT_WINDOW
     arr = _rate_store[ip]
-    # drop old timestamps
     while arr and arr[0] <= now - window:
         arr.pop(0)
     if len(arr) >= RATE_LIMIT_MAX:
@@ -125,13 +138,21 @@ app.add_middleware(
 # --- Startup Event ---
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database connection"""
+    """Initialize database connection and pre-load heavy data"""
     try:
         Database.connect_db()
         create_indexes()
         print("[OK] Database initialized successfully")
     except Exception as e:
         print(f"[ERROR] Database initialization error: {e}")
+
+    # Pre-load alerts groundwater data so first request is fast
+    try:
+        from alerts_routes import _build_alerts
+        _build_alerts()
+        print("[OK] Alerts groundwater data pre-loaded")
+    except Exception as e:
+        print(f"[WARN] Could not pre-load alerts data: {e}")
 
 # --- Shutdown Event ---
 @app.on_event("shutdown")

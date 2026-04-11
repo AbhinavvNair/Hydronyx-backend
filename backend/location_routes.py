@@ -451,16 +451,6 @@ class PlotInsightResponse(BaseModel):
     generated_at: str
 
 
-def _extract_user_id_from_bearer(authorization: Optional[str]) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
-    token = authorization[7:]
-    user_id = verify_token(token)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return user_id
-
-
 def _compute_location_metrics(lat: float, lon: float, months_ahead: int, k: int, power: float) -> Dict[str, Any]:
     """Compute location metrics without DB logging; reuses IDW + trend logic."""
     # Get nearest stations

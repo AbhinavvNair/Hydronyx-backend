@@ -59,6 +59,7 @@ class UserResponse(BaseModel):
     name: str
     created_at: datetime
     role: Optional[str] = "viewer"
+    persona: Optional[str] = None
 
 
 def hash_password(password: str) -> str:
