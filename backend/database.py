@@ -20,8 +20,8 @@ class Database:
             cls.client = MongoClient(
                 MONGODB_URL,
                 serverSelectionTimeoutMS=5000,
-                maxPoolSize=20,
-                minPoolSize=2,
+                maxPoolSize=50,
+                minPoolSize=5,
                 retryWrites=True,
                 retryReads=True,
             )

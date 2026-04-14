@@ -16,7 +16,7 @@ if not SECRET_KEY:
         "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
     )
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours, as documented
 REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 # Password hashing using Argon2

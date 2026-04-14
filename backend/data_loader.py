@@ -6,7 +6,6 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Any
 import os
-from geopy.distance import geodesic
 from shapely.geometry import Point, Polygon
 
 # Global variables to store loaded data
@@ -91,39 +90,62 @@ def get_time_cols() -> List[str]:
 def get_nearest_wells(lat: float, lon: float, k: int = 8) -> List[Tuple[float, Dict]]:
     """
     Find k nearest wells to given lat/lon.
-    
+    Uses a ±3° bounding box pre-filter + vectorized numpy distances to avoid
+    iterating all 32k+ stations with geodesic() (was the 56s bottleneck).
+
     Returns:
         List of (distance_km, well_info) tuples
     """
     meta_df = get_meta_df()
-    
+
     if len(meta_df) == 0:
         return []
-    
+
+    # --- Bounding box pre-filter (vectorised, no Python loop) ---
+    bbox_deg = 3.0
+    mask = (
+        (meta_df["Latitude"] >= lat - bbox_deg) &
+        (meta_df["Latitude"] <= lat + bbox_deg) &
+        (meta_df["Longitude"] >= lon - bbox_deg) &
+        (meta_df["Longitude"] <= lon + bbox_deg)
+    )
+    nearby = meta_df[mask]
+
+    # Fall back to full dataset if bounding box yields fewer than k stations
+    if len(nearby) < k:
+        nearby = meta_df
+
+    # --- Vectorised approximate distance (Haversine via numpy) ---
+    R = 6371.0  # Earth radius in km
+    lat_r = np.radians(nearby["Latitude"].values)
+    lon_r = np.radians(nearby["Longitude"].values)
+    dlat = lat_r - np.radians(lat)
+    dlon = lon_r - np.radians(lon)
+    a = np.sin(dlat / 2) ** 2 + np.cos(np.radians(lat)) * np.cos(lat_r) * np.sin(dlon / 2) ** 2
+    distances_km = 2 * R * np.arcsin(np.sqrt(a))
+
+    # Take only the k nearest
+    nearest_idx = np.argsort(distances_km)[:k]
+    rows = nearby.iloc[nearest_idx]
+    dists = distances_km[nearest_idx]
+
     wells = []
-    for _, row in meta_df.iterrows():
-        try:
-            dist = geodesic((lat, lon), (row["Latitude"], row["Longitude"])).km
-            well_info = {
-                "Station Code": row["Station Code"],
-                "Station Name": row["Station Name"],
-                "State": row["State"],
-                "District": row["District"],
-                "Block": row["Block"],
-                "Village": row["Village"],
-                "Latitude": row["Latitude"],
-                "Longitude": row["Longitude"],
-                "Aquifer Type": row["Aquifer Type"],
-                "Well Depth": row["Well Depth"],
-                "Latest Data": row.get("Latest  Data Available", "")
-            }
-            wells.append((dist, well_info))
-        except Exception as e:
-            continue
-    
-    # Sort by distance and return top k
-    wells.sort(key=lambda x: x[0])
-    return wells[:k]
+    for dist, (_, row) in zip(dists, rows.iterrows()):
+        wells.append((float(dist), {
+            "Station Code": row["Station Code"],
+            "Station Name": row["Station Name"],
+            "State": row["State"],
+            "District": row["District"],
+            "Block": row["Block"],
+            "Village": row["Village"],
+            "Latitude": row["Latitude"],
+            "Longitude": row["Longitude"],
+            "Aquifer Type": row["Aquifer Type"],
+            "Well Depth": row["Well Depth"],
+            "Latest Data": row.get("Latest  Data Available", ""),
+        }))
+
+    return wells
 
 def latest_gwl(station_code: str) -> Optional[float]:
     """
